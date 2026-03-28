@@ -76,12 +76,13 @@ class TabGenerator:
         為一組音符分配最佳的吉他指板位置。
 
         使用貪心演算法 + 局部最佳化：
+        - 泛音音符直接使用泛音偵測結果的弦和格位
         - 優先選擇低把位（對初學者友好）
         - 同時發聲的音符必須在不同弦上
         - 考慮手指跨度限制
 
         Args:
-            notes: 音符列表（來自 pitch_detector）
+            notes: 音符列表（來自 pitch_detector，可能含泛音標記）
 
         Returns:
             增加了 string, fret 欄位的音符列表
@@ -145,25 +146,38 @@ class TabGenerator:
         為一組同時發聲的音符分配弦和格。
 
         使用回溯法找到最佳分配：
+        - 泛音音符直接使用預先偵測的弦/格位
         - 每個音符必須在不同弦上
         - 最小化手指跨度
         - 偏好接近上一個位置的把位
         """
-        # 為每個音符找出所有可能的選項
+        # 先處理泛音音符（已有確定位置）
+        pre_assigned = {}  # idx -> (string, fret)
+        used_strings = set()
+        for idx, note in enumerate(group):
+            if note.get("is_harmonic"):
+                s = note["harmonic_string"]
+                f = note["harmonic_fret"]
+                pre_assigned[idx] = (s, f)
+                used_strings.add(s)
+
+        # 為非泛音音符找出所有可能的選項
         all_options = []
-        for note in group:
-            options = self.midi_to_fret_options(note["pitch"])
-            if not options:
-                # 音高超出吉他範圍，跳過
-                all_options.append([])
+        for idx, note in enumerate(group):
+            if idx in pre_assigned:
+                all_options.append([pre_assigned[idx]])
             else:
-                all_options.append(options)
+                options = self.midi_to_fret_options(note["pitch"])
+                if not options:
+                    all_options.append([])
+                else:
+                    all_options.append(options)
 
         # 用回溯法找最佳分配
         best_assignment = None
         best_score = float("inf")
 
-        def backtrack(idx, used_strings, current_assignment):
+        def backtrack(idx, bt_used_strings, current_assignment):
             nonlocal best_assignment, best_score
 
             if idx == len(group):
@@ -178,21 +192,22 @@ class TabGenerator:
             if not all_options[idx]:
                 # 無法分配，用 -1 標記
                 current_assignment.append((-1, -1))
-                backtrack(idx + 1, used_strings, current_assignment)
+                backtrack(idx + 1, bt_used_strings, current_assignment)
                 current_assignment.pop()
                 return
 
             for string_idx, fret in all_options[idx]:
-                if string_idx in used_strings:
+                if string_idx in bt_used_strings and idx not in pre_assigned:
                     continue
 
                 current_assignment.append((string_idx, fret))
-                used_strings.add(string_idx)
-                backtrack(idx + 1, used_strings, current_assignment)
-                used_strings.remove(string_idx)
+                bt_used_strings.add(string_idx)
+                backtrack(idx + 1, bt_used_strings, current_assignment)
+                if idx not in pre_assigned:
+                    bt_used_strings.remove(string_idx)
                 current_assignment.pop()
 
-        backtrack(0, set(), [])
+        backtrack(0, set(used_strings), [])
 
         # 將分配結果寫回音符
         result = []
@@ -292,9 +307,14 @@ class TabGenerator:
                 continue
 
             string_idx = note["string"]
-            fret_str = str(note["fret"])
 
-            # 寫入格數（可能是兩位數）
+            # 泛音用 <N> 標記，一般音符只顯示數字
+            if note.get("is_harmonic"):
+                fret_str = f"<{note['fret']}>"
+            else:
+                fret_str = str(note["fret"])
+
+            # 寫入格數（可能是多位字元）
             for j, ch in enumerate(fret_str):
                 if pos + j < total_chars:
                     strings[string_idx][pos + j] = ch

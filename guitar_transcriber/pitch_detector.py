@@ -60,7 +60,6 @@ def audio_to_midi(
         )
 
     from basic_pitch.inference import predict
-    from basic_pitch import ICASSP_2022_MODEL_PATH
     import pretty_midi
 
     audio_path = Path(audio_path)
@@ -72,9 +71,17 @@ def audio_to_midi(
 
     print("正在進行音高偵測（Basic Pitch）...")
 
+    # 取得 Basic Pitch 模型路徑（優先使用 ONNX 格式，相容性最好）
+    from basic_pitch import ICASSP_2022_MODEL_PATH
+    model_path = ICASSP_2022_MODEL_PATH
+    onnx_path = Path(model_path).with_suffix(".onnx")
+    if onnx_path.exists():
+        model_path = str(onnx_path)
+
     # Basic Pitch 推論
     model_output, midi_data, note_events = predict(
         audio_path=str(audio_path),
+        model_or_model_path=model_path,
         onset_threshold=onset_threshold,
         frame_threshold=frame_threshold,
         minimum_note_length=minimum_note_length,

@@ -27,3 +27,5 @@ Thumbs.db
 # Model cache (Demucs/Basic Pitch models can be large)
 *.pt
 *.onnx
+SynthTab/
+output/

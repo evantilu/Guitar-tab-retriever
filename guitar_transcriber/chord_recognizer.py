@@ -1,7 +1,7 @@
 """
 模組 4: 和弦辨識
 從音訊中辨識和弦進行，支援兩種模式：
-1. 基於 librosa 的 chroma 特徵分析
+1. 基於 librosa 的 chroma 特徵分析（改良版：長窗口 + smoothing + 合併）
 2. 基於 MIDI 音符的和弦推斷
 """
 
@@ -13,46 +13,29 @@ import numpy as np
 # 12 個音名
 PITCH_CLASSES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
-# 和弦模板：每個和弦對應一組相對於根音的半音程
+# 精簡和弦模板：只保留最常見的類型，避免過多選擇造成混淆
 CHORD_TEMPLATES = {
     "maj":     [0, 4, 7],
-    "min":     [0, 3, 7],
+    "m":       [0, 3, 7],
     "7":       [0, 4, 7, 10],
     "maj7":    [0, 4, 7, 11],
-    "min7":    [0, 3, 7, 10],
+    "m7":      [0, 3, 7, 10],
     "dim":     [0, 3, 6],
     "aug":     [0, 4, 8],
     "sus2":    [0, 2, 7],
     "sus4":    [0, 5, 7],
     "add9":    [0, 4, 7, 14],
-    "min9":    [0, 3, 7, 10, 14],
+    "m9":      [0, 3, 7, 10, 14],
     "9":       [0, 4, 7, 10, 14],
-    "6":       [0, 4, 7, 9],
-    "min6":    [0, 3, 7, 9],
     "dim7":    [0, 3, 6, 9],
-    "m7b5":    [0, 3, 6, 10],
-    "power":   [0, 7],
+    "5":       [0, 7],
 }
 
-# 和弦顯示名稱對映
+# 和弦顯示名稱
 CHORD_DISPLAY = {
-    "maj": "",
-    "min": "m",
-    "7": "7",
-    "maj7": "maj7",
-    "min7": "m7",
-    "dim": "dim",
-    "aug": "aug",
-    "sus2": "sus2",
-    "sus4": "sus4",
-    "add9": "add9",
-    "min9": "m9",
-    "9": "9",
-    "6": "6",
-    "min6": "m6",
-    "dim7": "dim7",
-    "m7b5": "m7b5",
-    "power": "5",
+    "maj": "", "m": "m", "7": "7", "maj7": "maj7", "m7": "m7",
+    "dim": "dim", "aug": "aug", "sus2": "sus2", "sus4": "sus4",
+    "add9": "add9", "m9": "m9", "9": "9", "dim7": "dim7", "5": "5",
 }
 
 
@@ -61,90 +44,86 @@ def _build_chroma_template(root: int, intervals: list[int]) -> np.ndarray:
     template = np.zeros(12)
     for interval in intervals:
         template[(root + interval) % 12] = 1.0
-    # 給根音更高的權重
-    template[root % 12] *= 1.5
-    return template / np.linalg.norm(template)
+    # 根音加重
+    template[root % 12] *= 2.0
+    # 五度音加重
+    if 7 in intervals:
+        template[(root + 7) % 12] *= 1.3
+    return template / (np.linalg.norm(template) + 1e-8)
 
 
 def recognize_chords_from_audio(
     audio_path: str | Path,
-    hop_length: int = 2048,
-    segment_duration: float = 0.5,
-    min_confidence: float = 0.5,
+    hop_length: int = 4096,
+    segment_duration: float = 2.0,
+    min_confidence: float = 0.45,
+    smooth_window: int = 3,
 ) -> list[dict]:
     """
     使用 librosa chroma 特徵從音訊辨識和弦。
+    改良版：更長的分析窗口 + chroma smoothing + 合併連續相同和弦。
 
     Args:
-        audio_path: 音訊檔案路徑
-        hop_length: STFT hop length
-        segment_duration: 每個分析段落的長度（秒）
-        min_confidence: 最低信心度閾值
+        audio_path: 音訊路徑
+        hop_length: STFT hop length（更大 = 更粗的時間解析度）
+        segment_duration: 每段分析長度（秒），2.0 秒適合指彈
+        min_confidence: 最低信心度
+        smooth_window: chroma 平滑窗口大小
 
     Returns:
-        和弦列表 [{start, end, chord, confidence}, ...]
+        和弦列表 [{start, end, duration, chord, confidence}, ...]
     """
     try:
         import librosa
     except ImportError:
-        raise RuntimeError("librosa 未安裝。請執行: pip install librosa")
+        raise RuntimeError("librosa 未安裝")
 
     audio_path = Path(audio_path)
     print("正在進行和弦辨識（chroma 分析）...")
 
-    # 載入音訊
     y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
 
-    # 計算 chroma 特徵 (CQT-based，對吉他音色更準確)
+    # CQT chroma — 對吉他泛音列更準確
     chroma = librosa.feature.chroma_cqt(
         y=y, sr=sr, hop_length=hop_length, n_chroma=12
     )
 
-    # 計算每個 frame 對應的時間
+    # Smoothing: 中位數濾波減少短暫波動
+    if smooth_window > 1:
+        from scipy.ndimage import median_filter
+        chroma = median_filter(chroma, size=(1, smooth_window))
+
     times = librosa.frames_to_time(
         np.arange(chroma.shape[1]), sr=sr, hop_length=hop_length
     )
 
-    # 將 chroma 分段，每段約 segment_duration 秒
+    # 按 segment_duration 分段
     frames_per_segment = max(1, int(segment_duration * sr / hop_length))
-    n_segments = chroma.shape[1] // frames_per_segment
+    n_segments = max(1, chroma.shape[1] // frames_per_segment)
 
-    chords = []
-    prev_chord = None
+    raw_chords = []
 
     for i in range(n_segments):
         start_frame = i * frames_per_segment
         end_frame = min((i + 1) * frames_per_segment, chroma.shape[1])
 
-        # 取這個段落的平均 chroma
-        segment_chroma = np.mean(chroma[:, start_frame:end_frame], axis=1)
+        # 段落平均 chroma
+        seg_chroma = np.mean(chroma[:, start_frame:end_frame], axis=1)
 
-        # 如果能量太低，標記為靜音
-        if np.max(segment_chroma) < 0.05:
-            if prev_chord and prev_chord.get("chord") == "N.C.":
-                prev_chord["end"] = times[end_frame - 1] if end_frame <= len(times) else times[-1]
-            else:
-                chord_info = {
-                    "start": times[start_frame],
-                    "end": times[end_frame - 1] if end_frame <= len(times) else times[-1],
-                    "chord": "N.C.",
-                    "confidence": 1.0,
-                }
-                chords.append(chord_info)
-                prev_chord = chord_info
+        # 靜音檢查
+        if np.max(seg_chroma) < 0.03:
             continue
 
-        # 正規化
-        segment_chroma = segment_chroma / (np.linalg.norm(segment_chroma) + 1e-8)
+        seg_chroma = seg_chroma / (np.linalg.norm(seg_chroma) + 1e-8)
 
-        # 跟所有和弦模板做比對
-        best_chord = None
+        # 比對和弦模板
+        best_chord = "N.C."
         best_score = -1
 
         for root in range(12):
             for chord_type, intervals in CHORD_TEMPLATES.items():
                 template = _build_chroma_template(root, intervals)
-                score = np.dot(segment_chroma, template)
+                score = float(np.dot(seg_chroma, template))
 
                 if score > best_score:
                     best_score = score
@@ -153,155 +132,173 @@ def recognize_chords_from_audio(
                     best_chord = f"{root_name}{suffix}"
 
         if best_score < min_confidence:
-            best_chord = "N.C."
+            continue
 
-        start_time = times[start_frame]
-        end_time = times[end_frame - 1] if end_frame <= len(times) else times[-1]
+        start_time = float(times[start_frame])
+        end_time = float(times[min(end_frame - 1, len(times) - 1)])
 
-        # 合併連續相同的和弦
-        if prev_chord and prev_chord["chord"] == best_chord:
-            prev_chord["end"] = end_time
-        else:
-            chord_info = {
-                "start": round(start_time, 3),
-                "end": round(end_time, 3),
-                "chord": best_chord,
-                "confidence": round(float(best_score), 3),
-            }
-            chords.append(chord_info)
-            prev_chord = chord_info
+        raw_chords.append({
+            "start": round(start_time, 3),
+            "end": round(end_time, 3),
+            "duration": round(end_time - start_time, 3),
+            "chord": best_chord,
+            "confidence": round(best_score, 3),
+        })
+
+    # 合併連續相同根音的和弦
+    chords = _merge_similar_chords(raw_chords)
 
     print(f"和弦辨識完成: 偵測到 {len(chords)} 個和弦段落")
     return chords
 
 
+def _merge_similar_chords(chords: list[dict], min_duration: float = 1.0) -> list[dict]:
+    """
+    合併連續的相同/相似和弦，並過濾過短的段落。
+    """
+    if not chords:
+        return []
+
+    merged = [chords[0].copy()]
+
+    for c in chords[1:]:
+        prev = merged[-1]
+        prev_root = _get_root(prev["chord"])
+        curr_root = _get_root(c["chord"])
+
+        # 如果根音相同，合併
+        if prev_root == curr_root:
+            # 保留信心度更高的和弦名稱
+            if c["confidence"] > prev["confidence"]:
+                prev["chord"] = c["chord"]
+                prev["confidence"] = c["confidence"]
+            prev["end"] = c["end"]
+            prev["duration"] = round(prev["end"] - prev["start"], 3)
+        else:
+            merged.append(c.copy())
+
+    # 過濾過短的和弦（< min_duration），吸收到前一個或後一個
+    filtered = []
+    for c in merged:
+        if c["duration"] >= min_duration:
+            filtered.append(c)
+        elif filtered:
+            # 過短的，併入前一個
+            filtered[-1]["end"] = c["end"]
+            filtered[-1]["duration"] = round(filtered[-1]["end"] - filtered[-1]["start"], 3)
+
+    return filtered
+
+
+def _get_root(chord_name: str) -> str:
+    """提取和弦根音"""
+    if not chord_name or chord_name == "N.C.":
+        return ""
+    r = chord_name[0]
+    if len(chord_name) >= 2 and chord_name[1] in "#b":
+        r = chord_name[:2]
+    return r
+
+
 def recognize_chords_from_notes(
     notes: list[dict],
-    segment_duration: float = 0.5,
+    segment_duration: float = 2.0,
 ) -> list[dict]:
     """
-    從 MIDI 音符資料推斷和弦。
-
-    這是一個替代方案：當你已經有了音符資料（來自 pitch_detector），
-    可以直接從音符組合推斷和弦，不需要重新分析音訊。
-
-    Args:
-        notes: 來自 pitch_detector 的音符列表
-        segment_duration: 分段長度（秒）
-
-    Returns:
-        和弦列表
+    從 MIDI 音符資料推斷和弦（改良版：更長窗口）。
     """
     if not notes:
         return []
 
     print("正在從 MIDI 音符推斷和弦...")
 
-    # 找出時間範圍
     max_time = max(n["end"] for n in notes)
     n_segments = int(np.ceil(max_time / segment_duration))
 
-    chords = []
+    raw_chords = []
     prev_chord = None
 
     for i in range(n_segments):
         t_start = i * segment_duration
         t_end = (i + 1) * segment_duration
 
-        # 找出這個時間段內活躍的音符
-        active_pitches = set()
+        # 收集這個時間段內的所有 pitch class，用持續時間加權
+        chroma = np.zeros(12)
         for note in notes:
             if note["start"] < t_end and note["end"] > t_start:
-                active_pitches.add(note["pitch"] % 12)
+                overlap = min(note["end"], t_end) - max(note["start"], t_start)
+                chroma[note["pitch"] % 12] += overlap
 
-        if len(active_pitches) < 2:
-            if active_pitches:
-                # 只有一個音，標記為單音
-                root_name = PITCH_CLASSES[list(active_pitches)[0]]
-                chord_name = f"{root_name}(note)"
-            else:
-                chord_name = "N.C."
-            confidence = 0.3
-        else:
-            # 用 pitch class 建構 chroma 向量
-            chroma = np.zeros(12)
-            for pc in active_pitches:
-                chroma[pc] = 1.0
-            chroma = chroma / (np.linalg.norm(chroma) + 1e-8)
+        if np.sum(chroma) < 0.01:
+            continue
 
-            best_chord = "N.C."
-            best_score = -1
+        chroma = chroma / (np.linalg.norm(chroma) + 1e-8)
 
-            for root in range(12):
-                for chord_type, intervals in CHORD_TEMPLATES.items():
-                    template = _build_chroma_template(root, intervals)
-                    score = np.dot(chroma, template)
-                    if score > best_score:
-                        best_score = score
-                        root_name = PITCH_CLASSES[root]
-                        suffix = CHORD_DISPLAY[chord_type]
-                        best_chord = f"{root_name}{suffix}"
+        best_chord = "N.C."
+        best_score = -1
 
-            chord_name = best_chord
-            confidence = float(best_score)
+        for root in range(12):
+            for chord_type, intervals in CHORD_TEMPLATES.items():
+                template = _build_chroma_template(root, intervals)
+                score = float(np.dot(chroma, template))
+                if score > best_score:
+                    best_score = score
+                    root_name = PITCH_CLASSES[root]
+                    suffix = CHORD_DISPLAY[chord_type]
+                    best_chord = f"{root_name}{suffix}"
 
-        # 合併連續相同和弦
-        if prev_chord and prev_chord["chord"] == chord_name:
+        if best_score < 0.4:
+            continue
+
+        chord_info = {
+            "start": round(t_start, 3),
+            "end": round(t_end, 3),
+            "duration": round(t_end - t_start, 3),
+            "chord": best_chord,
+            "confidence": round(best_score, 3),
+        }
+
+        # 合併連續相同
+        if prev_chord and _get_root(prev_chord["chord"]) == _get_root(best_chord):
+            if best_score > prev_chord["confidence"]:
+                prev_chord["chord"] = best_chord
+                prev_chord["confidence"] = best_score
             prev_chord["end"] = round(t_end, 3)
+            prev_chord["duration"] = round(prev_chord["end"] - prev_chord["start"], 3)
         else:
-            chord_info = {
-                "start": round(t_start, 3),
-                "end": round(t_end, 3),
-                "chord": chord_name,
-                "confidence": round(confidence, 3),
-            }
-            chords.append(chord_info)
+            raw_chords.append(chord_info)
             prev_chord = chord_info
 
-    print(f"和弦推斷完成: {len(chords)} 個和弦段落")
-    return chords
+    print(f"和弦推斷完成: {len(raw_chords)} 個和弦段落")
+    return raw_chords
 
 
 def format_chord_progression(chords: list[dict], beats_per_bar: int = 4) -> str:
-    """
-    將和弦列表格式化為易讀的和弦進行表示。
-
-    Args:
-        chords: 和弦列表
-        beats_per_bar: 每小節拍數
-
-    Returns:
-        格式化的和弦進行字串
-    """
+    """將和弦列表格式化為易讀的和弦進行。"""
     if not chords:
         return "（無和弦資料）"
 
-    lines = []
-    lines.append("=== 和弦進行 ===\n")
+    lines = ["=== 和弦進行 ===\n"]
 
-    for i, chord in enumerate(chords):
-        duration = chord["end"] - chord["start"]
-        conf_str = f"{chord['confidence']:.0%}" if chord["confidence"] > 0 else ""
+    for chord in chords:
+        duration = chord.get("duration", chord["end"] - chord["start"])
+        conf_str = f"{chord['confidence']:.0%}" if chord.get("confidence", 0) > 0 else ""
         time_str = _format_time(chord["start"])
         lines.append(
-            f"  {time_str}  {chord['chord']:<10s}  "
-            f"({duration:.1f}s)  {conf_str}"
+            f"  {time_str}  {chord['chord']:<10s}  ({duration:.1f}s)  {conf_str}"
         )
 
-    # 簡化摘要：只列出不重複的和弦順序
     unique_sequence = []
     for chord in chords:
-        if chord["chord"] != "N.C." and (
-            not unique_sequence or unique_sequence[-1] != chord["chord"]
-        ):
-            unique_sequence.append(chord["chord"])
+        name = chord.get("chord", "")
+        if name and name != "N.C." and (not unique_sequence or unique_sequence[-1] != name):
+            unique_sequence.append(name)
 
     lines.append(f"\n簡化進行: {' → '.join(unique_sequence)}")
     return "\n".join(lines)
 
 
 def _format_time(seconds: float) -> str:
-    """將秒數格式化為 MM:SS.ms"""
     minutes = int(seconds // 60)
     secs = seconds % 60
     return f"{minutes:02d}:{secs:05.2f}"

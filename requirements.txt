@@ -8,6 +8,7 @@ basic-pitch>=0.3.0        # Spotify 音高偵測 (Audio → MIDI)
 librosa>=0.10.0           # 音訊分析 (chroma 特徵, 和弦辨識)
 pretty-midi>=0.2.10       # MIDI 檔案處理
 numpy>=1.24.0             # 數值計算
+reportlab>=4.0            # PDF 六線譜輸出
 
 # === 間接依賴（通常會被自動安裝）===
 # torch                   # PyTorch (demucs 需要，會自動安裝)

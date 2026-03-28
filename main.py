@@ -24,8 +24,8 @@ def main():
   # 基本用法
   python main.py https://www.youtube.com/watch?v=XXXXXXX
 
-  # 跳過音源分離（較快，但精確度較低）
-  python main.py https://www.youtube.com/watch?v=XXXXXXX --skip-separation
+  # 啟用音源分離（適合多樂器影片）
+  python main.py https://www.youtube.com/watch?v=XXXXXXX --separate
 
   # 使用 Drop D 調弦
   python main.py https://www.youtube.com/watch?v=XXXXXXX --tuning drop_d
@@ -54,9 +54,9 @@ def main():
         help="吉他調弦（預設: standard）",
     )
     parser.add_argument(
-        "--skip-separation",
+        "--separate",
         action="store_true",
-        help="跳過音源分離，直接分析混合音訊（較快但不精確）",
+        help="啟用音源分離（適合有多種樂器的影片，預設關閉）",
     )
     parser.add_argument(
         "--demucs-model",
@@ -101,6 +101,18 @@ def main():
         help="Tab 每行寬度（預設: 80）",
     )
     parser.add_argument(
+        "--capo",
+        type=int,
+        default=0,
+        help="移調夾位置（0-12，預設: 0 表示無 Capo）",
+    )
+    parser.add_argument(
+        "--bpm",
+        type=float,
+        default=0,
+        help="手動指定 BPM（預設: 0 = 自動偵測）",
+    )
+    parser.add_argument(
         "--no-save",
         action="store_true",
         help="不儲存中間檔案",
@@ -122,7 +134,8 @@ def main():
         url=args.url,
         output_dir=args.output,
         tuning=args.tuning,
-        skip_separation=args.skip_separation,
+        capo=args.capo,
+        skip_separation=not args.separate,
         demucs_model=args.demucs_model,
         device=args.device,
         onset_threshold=args.onset_threshold,
@@ -131,6 +144,7 @@ def main():
         chars_per_second=args.tab_density,
         line_width=args.line_width,
         save_intermediate=not args.no_save,
+        manual_bpm=args.bpm if args.bpm > 0 else None,
     )
 
     # 輸出結果
